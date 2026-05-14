@@ -453,132 +453,194 @@ verb 3" > /etc/openvpn/server/client-common.txt
 else
 	clear
 	echo "OpenVPN is already installed."
-	echo
-	echo "Select an option:"
-	echo "   1) Add a new client"
-	echo "   2) Revoke an existing client"
-	echo "   3) Remove OpenVPN"
-	echo "   4) Exit"
-	read -p "Option: " option
-	until [[ "$option" =~ ^[1-4]$ ]]; do
-		echo "$option: invalid selection."
-		read -p "Option: " option
-	done
-	case "$option" in
-		1)
-			echo
-			echo "Provide a name for the client:"
+
+	add_client_by_name() {
+		echo
+		echo "Provide a name for the client:"
+		read -p "Name: " unsanitized_client
+		client=$(sed 's/[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]/_/g' <<< "$unsanitized_client")
+		while [[ -z "$client" || -e /etc/openvpn/server/easy-rsa/pki/issued/"$client".crt ]]; do
+			echo "$client: invalid name."
 			read -p "Name: " unsanitized_client
 			client=$(sed 's/[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]/_/g' <<< "$unsanitized_client")
-			while [[ -z "$client" || -e /etc/openvpn/server/easy-rsa/pki/issued/"$client".crt ]]; do
-				echo "$client: invalid name."
-				read -p "Name: " unsanitized_client
-				client=$(sed 's/[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]/_/g' <<< "$unsanitized_client")
-			done
-			cd /etc/openvpn/server/easy-rsa/
-			./easyrsa --batch --days=3650 build-client-full "$client" nopass
-			# Build the $client.ovpn file, stripping comments from easy-rsa in the process
-			grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$script_dir"/"$client".ovpn
+		done
+		cd /etc/openvpn/server/easy-rsa/
+		./easyrsa --batch --days=3650 build-client-full "$client" nopass
+		# Build the $client.ovpn file, stripping comments from easy-rsa in the process
+		grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$script_dir"/"$client".ovpn
+		echo
+		echo "$client added. Configuration available in:" "$script_dir"/"$client.ovpn"
+	}
+
+	list_valid_clients() {
+		mapfile -t clients < <(
+			tail -n +2 /etc/openvpn/server/easy-rsa/pki/index.txt |
+			awk -F'=' '/^V/ {print $NF}' |
+			sort
+		)
+
+		if ((${#clients[@]} == 0)); then
 			echo
-			echo "$client added. Configuration available in:" "$script_dir"/"$client.ovpn"
-			exit
-		;;
-		2)
-			# This option could be documented a bit better and maybe even be simplified
-			# ...but what can I say, I want some sleep too
-			number_of_clients=$(tail -n +2 /etc/openvpn/server/easy-rsa/pki/index.txt | grep -c "^V")
-			if [[ "$number_of_clients" = 0 ]]; then
-				echo
-				echo "There are no existing clients!"
-				exit
+			echo "There are no existing clients!"
+			return 1
+		fi
+
+		echo
+		echo "Existing clients:"
+		if command -v column >/dev/null 2>&1; then
+			printf '%s\n' "${clients[@]}" | column
+		else
+			printf '  %s\n' "${clients[@]}"
+		fi
+	}
+
+	delete_client_ovpn_files() {
+		rm -f "$script_dir"/"$client".ovpn
+		rm -f ~/"$client".ovpn
+		rm -f "/root/${client}.ovpn"
+		rm -f "/etc/openvpn/client-configs/files/${client}.ovpn"
+	}
+
+	revoke_client_by_name() {
+		local revoke_prompt="${1:-Enter the exact client name to revoke: }"
+		local allow_empty="${2:-0}"
+
+		list_valid_clients || return 1
+
+		echo
+		read -rp "$revoke_prompt" client
+		client=${client%.ovpn}
+		if [[ -z "$client" && "$allow_empty" = "1" ]]; then
+			return 1
+		fi
+		while [[ -z "$client" ]] || ! grep -q "^V.*=${client}$" /etc/openvpn/server/easy-rsa/pki/index.txt; do
+			echo "'$client' is not a valid client."
+			read -rp "$revoke_prompt" client
+			client=${client%.ovpn}
+			if [[ -z "$client" && "$allow_empty" = "1" ]]; then
+				return 1
 			fi
-			echo
-			echo "Select the client to revoke:"
-			tail -n +2 /etc/openvpn/server/easy-rsa/pki/index.txt | grep "^V" | cut -d '=' -f 2 | nl -s ') '
-			read -p "Client: " client_number
-			until [[ "$client_number" =~ ^[0-9]+$ && "$client_number" -le "$number_of_clients" ]]; do
-				echo "$client_number: invalid selection."
-				read -p "Client: " client_number
-			done
-			client=$(tail -n +2 /etc/openvpn/server/easy-rsa/pki/index.txt | grep "^V" | cut -d '=' -f 2 | sed -n "$client_number"p)
-			echo
+		done
+
+		echo
+		read -p "Confirm $client revocation? [y/N]: " revoke
+		until [[ "$revoke" =~ ^[yYnN]*$ ]]; do
+			echo "$revoke: invalid selection."
 			read -p "Confirm $client revocation? [y/N]: " revoke
-			until [[ "$revoke" =~ ^[yYnN]*$ ]]; do
-				echo "$revoke: invalid selection."
-				read -p "Confirm $client revocation? [y/N]: " revoke
-			done
-			if [[ "$revoke" =~ ^[yY]$ ]]; then
-				cd /etc/openvpn/server/easy-rsa/
-				./easyrsa --batch revoke "$client"
-				./easyrsa --batch --days=3650 gen-crl
-				rm -f /etc/openvpn/server/crl.pem
-				rm -f /etc/openvpn/server/easy-rsa/pki/reqs/"$client".req
-				rm -f /etc/openvpn/server/easy-rsa/pki/private/"$client".key
-				cp /etc/openvpn/server/easy-rsa/pki/crl.pem /etc/openvpn/server/crl.pem
-				# CRL is read with each client connection, when OpenVPN is dropped to nobody
-				chown nobody:"$group_name" /etc/openvpn/server/crl.pem
-				echo
-				echo "$client revoked!"
-			else
-				echo
-				echo "$client revocation aborted!"
-			fi
-			exit
-		;;
-		3)
+		done
+
+		if [[ "$revoke" =~ ^[yY]$ ]]; then
+			cd /etc/openvpn/server/easy-rsa/
+			./easyrsa --batch revoke "$client"
+			./easyrsa --batch --days=3650 gen-crl
+			rm -f /etc/openvpn/server/crl.pem
+			rm -f /etc/openvpn/server/easy-rsa/pki/reqs/"$client".req
+			rm -f /etc/openvpn/server/easy-rsa/pki/private/"$client".key
+			cp /etc/openvpn/server/easy-rsa/pki/crl.pem /etc/openvpn/server/crl.pem
+			# CRL is read with each client connection, when OpenVPN is dropped to nobody
+			chown nobody:"$group_name" /etc/openvpn/server/crl.pem
+			delete_client_ovpn_files
 			echo
-			read -p "Confirm OpenVPN removal? [y/N]: " remove
-			until [[ "$remove" =~ ^[yYnN]*$ ]]; do
-				echo "$remove: invalid selection."
+			echo "$client revoked and .ovpn file removed!"
+		else
+			echo
+			echo "$client revocation aborted!"
+		fi
+	}
+
+	echo
+	while true; do
+		echo "Select an option:"
+		echo "   1) Add a new client"
+		echo "   2) Revoke an existing client"
+		echo "   3) Continuously revoke clients"
+		echo "   4) Continuously add clients"
+		echo "   5) Exit"
+		read -p "Option: " option
+		until [[ "$option" =~ ^[1-5]$ || "$option" = "remove" ]]; do
+			echo "$option: invalid selection."
+			read -p "Option: " option
+		done
+		case "$option" in
+			1)
+				add_client_by_name
+				echo
+			;;
+			2)
+				revoke_client_by_name
+				echo
+			;;
+			3)
+				while true; do
+					revoke_client_by_name "Enter the exact client name to revoke (Enter to quit): " 1 || break
+					echo
+				done
+				echo
+			;;
+			4)
+				while true; do
+					add_client_by_name
+					echo
+				done
+			;;
+			5)
+				exit
+			;;
+			remove)
+				echo
 				read -p "Confirm OpenVPN removal? [y/N]: " remove
-			done
-			if [[ "$remove" =~ ^[yY]$ ]]; then
-				port=$(grep '^port ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
-				protocol=$(grep '^proto ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
-				if systemctl is-active --quiet firewalld.service; then
-					ip=$(firewall-cmd --direct --get-rules ipv4 nat POSTROUTING | grep '\-s 10.8.0.0/24 '"'"'!'"'"' -d 10.8.0.0/24' | grep -oE '[^ ]+$')
-					# Using both permanent and not permanent rules to avoid a firewalld reload.
-					firewall-cmd --remove-port="$port"/"$protocol"
-					firewall-cmd --zone=trusted --remove-source=10.8.0.0/24
-					firewall-cmd --permanent --remove-port="$port"/"$protocol"
-					firewall-cmd --permanent --zone=trusted --remove-source=10.8.0.0/24
-					firewall-cmd --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
-					firewall-cmd --permanent --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
-					if grep -qs "server-ipv6" /etc/openvpn/server/server.conf; then
-						ip6=$(firewall-cmd --direct --get-rules ipv6 nat POSTROUTING | grep '\-s fddd:1194:1194:1194::/64 '"'"'!'"'"' -d fddd:1194:1194:1194::/64' | grep -oE '[^ ]+$')
-						firewall-cmd --zone=trusted --remove-source=fddd:1194:1194:1194::/64
-						firewall-cmd --permanent --zone=trusted --remove-source=fddd:1194:1194:1194::/64
-						firewall-cmd --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "$ip6"
-						firewall-cmd --permanent --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "$ip6"
+				until [[ "$remove" =~ ^[yYnN]*$ ]]; do
+					echo "$remove: invalid selection."
+					read -p "Confirm OpenVPN removal? [y/N]: " remove
+				done
+				if [[ "$remove" =~ ^[yY]$ ]]; then
+					port=$(grep '^port ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
+					protocol=$(grep '^proto ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
+					if systemctl is-active --quiet firewalld.service; then
+						ip=$(firewall-cmd --direct --get-rules ipv4 nat POSTROUTING | grep '\-s 10.8.0.0/24 '"'"'!'"'"' -d 10.8.0.0/24' | grep -oE '[^ ]+$')
+						# Using both permanent and not permanent rules to avoid a firewalld reload.
+						firewall-cmd --remove-port="$port"/"$protocol"
+						firewall-cmd --zone=trusted --remove-source=10.8.0.0/24
+						firewall-cmd --permanent --remove-port="$port"/"$protocol"
+						firewall-cmd --permanent --zone=trusted --remove-source=10.8.0.0/24
+						firewall-cmd --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
+						firewall-cmd --permanent --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
+						if grep -qs "server-ipv6" /etc/openvpn/server/server.conf; then
+							ip6=$(firewall-cmd --direct --get-rules ipv6 nat POSTROUTING | grep '\-s fddd:1194:1194:1194::/64 '"'"'!'"'"' -d fddd:1194:1194:1194::/64' | grep -oE '[^ ]+$')
+							firewall-cmd --zone=trusted --remove-source=fddd:1194:1194:1194::/64
+							firewall-cmd --permanent --zone=trusted --remove-source=fddd:1194:1194:1194::/64
+							firewall-cmd --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "$ip6"
+							firewall-cmd --permanent --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "$ip6"
+						fi
+					else
+						systemctl disable --now openvpn-iptables.service
+						rm -f /etc/systemd/system/openvpn-iptables.service
 					fi
+					if sestatus 2>/dev/null | grep "Current mode" | grep -q "enforcing" && [[ "$port" != 1194 ]]; then
+						semanage port -d -t openvpn_port_t -p "$protocol" "$port"
+					fi
+					systemctl disable --now openvpn-server@server.service
+					rm -f /etc/systemd/system/openvpn-server@server.service.d/disable-limitnproc.conf
+					rm -f /etc/sysctl.d/99-openvpn-forward.conf
+					if [[ "$os" = "debian" || "$os" = "ubuntu" ]]; then
+						rm -rf /etc/openvpn/server
+						apt-get remove --purge -y openvpn
+					else
+						# Else, OS must be CentOS or Fedora
+						dnf remove -y openvpn
+						rm -rf /etc/openvpn/server
+					fi
+					echo
+					echo "OpenVPN removed!"
 				else
-					systemctl disable --now openvpn-iptables.service
-					rm -f /etc/systemd/system/openvpn-iptables.service
+					echo
+					echo "OpenVPN removal aborted!"
 				fi
-				if sestatus 2>/dev/null | grep "Current mode" | grep -q "enforcing" && [[ "$port" != 1194 ]]; then
-					semanage port -d -t openvpn_port_t -p "$protocol" "$port"
-				fi
-				systemctl disable --now openvpn-server@server.service
-				rm -f /etc/systemd/system/openvpn-server@server.service.d/disable-limitnproc.conf
-				rm -f /etc/sysctl.d/99-openvpn-forward.conf
-				if [[ "$os" = "debian" || "$os" = "ubuntu" ]]; then
-					rm -rf /etc/openvpn/server
-					apt-get remove --purge -y openvpn
-				else
-					# Else, OS must be CentOS or Fedora
-					dnf remove -y openvpn
-					rm -rf /etc/openvpn/server
-				fi
-				echo
-				echo "OpenVPN removed!"
-			else
-				echo
-				echo "OpenVPN removal aborted!"
-			fi
-			exit
-		;;
-		4)
-			exit
-		;;
-	esac
+				exit
+			;;
+		esac
+	done
 fi
+
+
+
